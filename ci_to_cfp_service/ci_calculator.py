@@ -22,10 +22,11 @@ Notes:
 
 from __future__ import annotations
 import argparse, csv, os, sys, time, json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Tuple
 import requests
 from dateutil import parser as dtparse
+import random
 
 ELECTRICITYMAPS_API = "https://api.electricitymap.org/v3/carbon-intensity/forecast"
 DEFAULT_PUE = 1.4
@@ -58,12 +59,22 @@ def em_headers() -> Dict[str, str]:
     if not tok:
         print("ELECTRICITYMAPS_TOKEN not set", file=sys.stderr)
         sys.exit(2)
-    return {"Authorization": f"Bearer {tok}"}
+    print(f"Token being used: {tok}")
+    return {"auth-token": f"{tok}"}
 
-def fetch_ci_forecast(lat: float, lon: float) -> List[Dict]:
+def fetch_ci_forecast(lat: float, lon: float, use_mock: bool = False) -> List[Dict]:
     """
     Returns list of points: [{"datetime": "...Z", "carbonIntensity": <int>, "emissionFactorType": "lifecycle", ...}, ...]
     """
+    if use_mock:
+        points = []
+        now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        for h in range(72):
+            dt = now + timedelta(hours=h)
+            ci = random.randint(150, 600)
+            points.append({"datetime": dt.isoformat(), "carbonIntensity": ci})
+        return points
+    
     params = {"lat": lat, "lon": lon}
     last_err = None
     for _ in range(RETRIES + 1):
@@ -131,6 +142,7 @@ def main():
     ap.add_argument("--out-dir", default="out", help="Directory for outputs.")
     ap.add_argument("--pue", type=float, default=DEFAULT_PUE, help="Static PUE (default 1.4).")
     ap.add_argument("--limit", type=int, default=None, help="Limit number of sites for a quick run.")
+    ap.add_argument("--use-mock", action="store_true", help="Use mock CI values instead of API")
     args = ap.parse_args()
 
     sites = load_sites(args.sites_json)
@@ -143,7 +155,7 @@ def main():
         lat, lon = s["latitude"], s["longitude"]
         print(f"[{i}/{len(sites)}] {name} @ ({lat},{lon}) …", file=sys.stderr)
         try:
-            points = fetch_ci_forecast(lat, lon)
+            points = fetch_ci_forecast(lat, lon, use_mock=args.use_mock)
             sumry = summarise_forecast(points, args.pue)
             csv_path = write_hourly_csv(os.path.join(args.out_dir, "hourly"), name, points, args.pue)
             summaries.append({
