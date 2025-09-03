@@ -1,0 +1,2 @@
+export $(grep -v '^#' .env | xargs) # To export the environment variables (for authentication)
+python ci_to_cfp_service/ci_calculator.py --sites-json output/sites_enriched.json --out-dir output --pue=1.4 --use-mock --limit=30
