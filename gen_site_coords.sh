@@ -1,0 +1,1 @@
+python goc_db_fetch_service/fetch_goc_db.py --format json --output site_latlng.json --scope EGI
