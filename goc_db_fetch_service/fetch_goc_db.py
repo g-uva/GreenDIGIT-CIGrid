@@ -24,6 +24,7 @@ import csv
 import json
 import sys
 import time
+import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
@@ -35,6 +36,10 @@ DEFAULT_BASE_URL = "https://goc.egi.eu/gocdbpi"
 PUBLIC_ENTRY = "/public/"
 
 NS = {}  # no namespaces in the examples, keep simple
+
+headers = {
+    "Authorization": f"Bearer {os.environ["GOC_AUTH_BEARER"]}"
+}
 
 def build_url(base_url: str, method: str, **params) -> str:
     q = {"method": method}

@@ -1,0 +1,1 @@
+python gocdb_postprocess/gocdb_postprocess.py site_latlng.json sites_enriched.json

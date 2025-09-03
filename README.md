@@ -1,6 +1,8 @@
 ## CI to CFP
 - [ ] Write description here. :)
 
+- We store all authentication data inside of the `.env` file.
+
 ### Roadmap
 - Per-job CFP: wire in your workload energy estimates (kWh) to output absolute grams CO₂e per job/window.
 - Dynamic PUE: add a simple table (per site) to override the static 1.4 when you obtain better values; later, call a PUE data source when available.
