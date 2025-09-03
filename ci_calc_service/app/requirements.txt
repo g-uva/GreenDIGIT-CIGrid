@@ -1,4 +1,3 @@
-# These are used for all the services inside this repository. No need to complicate.
 fastapi==0.111.0
 uvicorn[standard]==0.30.3
 requests==2.32.3
