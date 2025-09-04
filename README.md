@@ -28,11 +28,37 @@ greendigit-cigrid/
 │  ├─ app/
 │  │  ├─ main.py
 │  │  └─ requirements.txt
-│  ├─ Dockerfile
-│  └─ .env.example
+│  └─ Dockerfile
 ├─ data/
-│  └─ sites_enriched.json
+│  ├─ sites_raw.json
+│  └─ sites_latlngpue.json
 └─ README.md
+```
+
+## Data prerequisites (GOC DB → Sites catalogue)
+
+### Data prerequisites (GOC DB → Sites catalogue)
+
+This service expects a sites catalogue with coordinates (and optional PUE), typically produced by two helper services:
+
+1. **goc_db_fetch_service** → fetches grid sites from GOC DB and writes a raw JSON without coordinates/PUE.
+   - Example:
+     ```bash
+     python fetch_goc_db.py --format json --output sites_raw.json
+     ```
+
+2. **gocdb_postprocess** → enriches the raw list with realistic coordinates and a static PUE (e.g., 1.4) to produce `sites_enriched.json`.
+   - Example:
+     ```bash
+     python gocdb_postprocess.py sites_raw.json data/sites_enriched.json
+     ```
+
+The resulting file shape (used by this CI service via `SITES_JSON`):
+```json
+[
+  {"site_name":"CERN-PROD","latitude":46.2331,"longitude":6.0559,"pue":1.4},
+  {"site_name":"RAL-LCG2","latitude":51.5714,"longitude":-1.3080,"pue":1.4}
+]
 ```
 
 ## Quick usage
