@@ -1,15 +1,21 @@
 # 🌱🌍♻️ GreenDIGIT CI Grid — CI→CFP Microservice
-Microservice to compute **Carbon Intensity (CI)**, **Effective CI**, and **Carbon Footprint (CFP)**. Includes ranking of sites by lowest Effective CI.
 
-### Roadmap
-- Per-job CFP: wire in your workload energy estimates (kWh) to output absolute grams CO₂e per job/window.
-- Dynamic PUE: add a simple table (per site) to override the static 1.4 when you obtain better values; later, call a PUE data source when available.
-- Fallback provider: optionally add providers like WattTime or UK’s Carbon Intensity API for regions where Electricity Maps isn’t available. 
-- API hygiene: respect rate limits with a small backoff; cache per-site responses for 10–15 minutes to avoid redundant calls.
+FastAPI microservice that predicts **Carbon Intensity (CI)** per location/time and derives **Effective CI** and **Carbon Footprint (CFP)**. Includes a **ranking** endpoint to order sites by best (lowest) Effective CI at a given hour.
 
-## How calculation works
-- Effective CI (gCO₂e/kWh): CI_eff = CI × PUE
-- CFP (gCO₂e): CFP = CI_eff × E (E = energy consumption in kWh)
+## How the calculation works
+
+$$
+\mathrm{CI}_{\mathrm{eff}} = \mathrm{CI} \times \mathrm{PUE}
+$$
+
+$$
+\mathrm{CFP}\;[\mathrm{gCO_2e}] = \mathrm{CI}_{\mathrm{eff}}\;[\mathrm{gCO_2e/kWh}] \times E\;[\mathrm{kWh}]
+$$
+
+Also in kg: 
+$$ 
+\mathrm{CFP}_{kg} = \mathrm{CFP}/1000 
+$$
 
 ## Folder structure
 ```text
@@ -22,19 +28,14 @@ greendigit-cigrid/
 │  └─ .env.example
 ├─ data/
 │  └─ sites_enriched.json
-├─ scripts/
-│  ├─ start_ci_docker.sh
-│  ├─ gen_jwt_secret.sh
-│  └─ smoke_test.sh
 └─ README.md
 ```
 
-## Scripts
-- **start_ci_docker.sh** → Build & run CI service on port 8011.
-- **gen_jwt_secret.sh** → Generate JWT_TOKEN in `.env` if missing.
-- **smoke_test.sh** → Simple curl tests for health and /ci.
+## Quick usage
 
-## Example request
+### `/ci` — compute CI / Effective CI (and optional CFP)
+
+**JSON example**
 ```json
 {
   "lat": 52.0,
@@ -46,4 +47,33 @@ greendigit-cigrid/
 }
 ```
 
-Returns CI, Effective CI, and optional CFP in g and kg.
+**Curl**
+```bash
+curl -s -X POST http://localhost:8011/ci   -H "Authorization: Bearer $TOKEN"   -H "Content-Type: application/json"   -d '{"lat":52.0,"lon":5.0,"time":"2025-09-04T12:00:00Z","pue":1.4,"use_mock":true,"energy_kwh":3.0}'
+```
+
+### `/rank-sites` — order sites by best Effective CI at a start time
+
+**JSON example**
+```json
+{
+  "start_time": "2025-09-04T12:00:00Z",
+  "use_mock": true
+}
+```
+
+**Curl**
+```bash
+curl -s -X POST http://localhost:8011/rank-sites   -H "Authorization: Bearer $TOKEN"   -H "Content-Type: application/json"   -d '{"start_time":"2025-09-04T12:00:00Z","use_mock":true}'
+```
+
+### Auth
+All protected endpoints require:
+```
+Authorization: Bearer <jwt>
+```
+
+### Notes
+- **Mock mode** (`use_mock: true`) generates random CI values (150–600 gCO₂e/kWh) for prototyping.
+- PUE can be per-site (in `data/sites_enriched.json`) or default via `PUE_DEFAULT`.
+- The service validates tokens by calling your auth server’s `/verify_token` (configure `AUTH_VERIFY_URL`).

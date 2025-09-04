@@ -142,12 +142,78 @@ def mock_ci_value() -> int:
 # --------------------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------------------
-app = FastAPI(
+app = FastAPI(description=r"""
+## CI→CFP Service
+
+Computes **Carbon Intensity (CI)** per location/time and derives **Effective CI** and optional **Carbon Footprint (CFP)**.
+
+### Formulae
+
+$$
+\mathrm{CI}_{\mathrm{eff}} = \mathrm{CI} \times \mathrm{PUE}
+$$
+
+$$
+\mathrm{CFP}\;[\mathrm{gCO_2e}] = \mathrm{CI}_{\mathrm{eff}}\;[\mathrm{gCO_2e/kWh}] \times E\;[\mathrm{kWh}]
+$$
+
+(Also reported in kg: \( \mathrm{CFP}_{kg} = \mathrm{CFP}/1000 \)).
+
+### Auth
+All protected endpoints require:
+```
+Authorization: Bearer <jwt>
+```
+
+### Endpoints
+
+#### POST /ci
+Compute CI/Effective CI (and optional CFP) for a single location/time.
+
+**Example request body**
+```json
+{
+  "lat": 52.0,
+  "lon": 5.0,
+  "time": "2025-09-04T12:00:00Z",
+  "pue": 1.4,
+  "use_mock": true,
+  "energy_kwh": 3.0
+}
+```
+
+**Curl**
+```bash
+curl -s -X POST http://localhost:8011/ci \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"lat":52.0,"lon":5.0,"time":"2025-09-04T12:00:00Z","pue":1.4,"use_mock":true,"energy_kwh":3.0}'
+```
+
+#### POST /rank-sites
+Rank sites by lowest Effective CI at `start_time`.
+
+**Example request body**
+```json
+{
+  "start_time": "2025-09-04T12:00:00Z",
+  "use_mock": true
+}
+```
+
+**Curl**
+```bash
+curl -s -X POST http://localhost:8011/rank-sites \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"start_time":"2025-09-04T12:00:00Z","use_mock":true}'
+```
+""",
+
     title="GreenDIGIT WP6.2 Authentication Server API",
     version="1.0.0",
     swagger_ui_parameters={"persistAuthorization": True},
-    root_path="/gd-ci-service"
-)
+    root_path="/gd-ci-service")
 
 @app.get("/health")
 def health():
