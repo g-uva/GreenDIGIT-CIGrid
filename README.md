@@ -2,6 +2,10 @@
 
 FastAPI microservice that predicts **Carbon Intensity (CI)** per location/time and derives **Effective CI** and **Carbon Footprint (CFP)**. Includes a **ranking** endpoint to order sites by best (lowest) Effective CI at a given hour.
 
+## Roadmap
+- [ ] Apply ICTF X502 certification to get Location and PUE from sites (GOC DB).
+- [ ] Implement dynamic calculation of the CI. For the moment we're using mock data (generated).
+
 ## How the calculation works
 
 $$
