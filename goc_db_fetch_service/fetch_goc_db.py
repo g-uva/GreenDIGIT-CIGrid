@@ -38,7 +38,7 @@ PUBLIC_ENTRY = "/public/"
 NS = {}  # no namespaces in the examples, keep simple
 
 headers = {
-    "Authorization": f"Bearer {os.environ["GOC_AUTH_BEARER"]}"
+    "Authorization": f"Bearer {os.environ['GOC_AUTH_BEARER']}"
 }
 
 def build_url(base_url: str, method: str, **params) -> str:
@@ -152,6 +152,12 @@ def main():
     have = sum(1 for r in results if r["latitude"] is not None and r["longitude"] is not None)
     unauth = sum(1 for r in results if r["error"] and r["error"].startswith("unauthorized"))
     sys.stderr.write(f"Sites: {len(results)} | with coords: {have} | unauthorized: {unauth}\n")
+    
+    # Ensure that the folder exists
+    try:
+        os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    except Exception as e:
+        return None, None, f"error:{type(e).__name__}"
 
     # 3) write output
     if args.output == "-":
