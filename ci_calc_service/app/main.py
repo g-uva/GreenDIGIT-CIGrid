@@ -25,7 +25,7 @@ SITES_JSON     = os.environ.get("SITES_JSON")  # optional: path to a JSON array 
 # Auth
 # --------------------------------------------------------------------------------------
 security = HTTPBearer()
-AUTH_VERIFY_URL = os.environ.get("AUTH_VERIFY_URL", "http://127.0.0.1:8000/gd-cim-api/verify_token")
+AUTH_VERIFY_URL = os.environ.get("AUTH_VERIFY_URL", "https://mc-a4.lab.uvalight.net/gd-cim-api/verify_token")
 
 def require_bearer(creds: HTTPAuthorizationCredentials = Depends(security)):
     token = creds.credentials
@@ -47,6 +47,7 @@ class CIRequest(BaseModel):
     time: Optional[datetime] = Field(None, description="UTC timepoint. If omitted, uses latest.")
     pue: float = DEFAULT_PUE
     use_mock: bool = False
+    energy_kwh: Optional[float] = None
 
 class CIResponse(BaseModel):
     source: str
@@ -55,6 +56,8 @@ class CIResponse(BaseModel):
     ci_gco2_per_kwh: float
     pue: float
     effective_ci_gco2_per_kwh: float
+    cfp_g: Optional[float] = None
+    cfp_kg: Optional[float] = None
 
 class Site(BaseModel):
     site_name: str
@@ -67,6 +70,7 @@ class RankRequest(BaseModel):
     sites: Optional[List[Site]] = None     # if omitted, will load from SITES_JSON (if set)
     use_mock: bool = False
     pue_default: float = DEFAULT_PUE
+    energy_kwh: Optional[float] = None
 
 class RankedSite(BaseModel):
     site_name: str
@@ -138,7 +142,12 @@ def mock_ci_value() -> int:
 # --------------------------------------------------------------------------------------
 # FastAPI app
 # --------------------------------------------------------------------------------------
-app = FastAPI(title="CI→CFP Microservice", version="0.1.0")
+app = FastAPI(
+    title="GreenDIGIT WP6.2 Authentication Server API",
+    version="1.0.0",
+    swagger_ui_parameters={"persistAuthorization": True},
+    root_path="/gd-ci-service"
+)
 
 @app.get("/health")
 def health():
@@ -150,22 +159,35 @@ def compute_ci(req: CIRequest, _=Depends(require_bearer)):
         when = round_to_hour(req.time or datetime.now(timezone.utc))
         ci = float(mock_ci_value())
         eff = ci * req.pue
+        cfp_g = cfp_kg = None
+        if req.energy_kwh is not None:
+            cfp_g = eff * req.energy_kwh
+            cfp_kg = cfp_g / 1000.0
         return CIResponse(source="mock", zone=None, datetime=when.isoformat(),
-                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff)
+                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
+        
+    def compute_cfp(energy_kwh: float = None):
+        cfp_g = cfp_kg = None
+        if energy_kwh is not None:
+            cfp_g = eff * req.energy_kwh
+            cfp_kg = cfp_g / 1000.0
+        return cfp_g, cfp_kg
 
     if req.time:
         fc = fetch_ci_forecast(req.lat, req.lon)
         chosen = pick_ci_at_time(fc, req.time)
         ci = float(chosen["carbonIntensity"])
         eff = ci * req.pue
+        cfp_g, cfp_kg = compute_cfp(req.energy_kwh)
         return CIResponse(source="electricitymaps", zone=None, datetime=chosen["datetime"],
-                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff)
+                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
     else:
         latest = fetch_ci_latest(req.lat, req.lon)
         ci = float(latest["carbonIntensity"])
         eff = ci * req.pue
+        cfp_g, cfp_kg = compute_cfp(req.energy_kwh)
         return CIResponse(source="electricitymaps", zone=latest.get("zone"), datetime=latest["datetime"],
-                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff)
+                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
 
 def load_sites_from_env() -> List[Site]:
     if not SITES_JSON:
