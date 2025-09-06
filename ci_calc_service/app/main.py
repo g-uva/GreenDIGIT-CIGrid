@@ -13,14 +13,15 @@ from pydantic import BaseModel, Field
 # --------------------------------------------------------------------------------------
 # Config
 # --------------------------------------------------------------------------------------
-ELECTRICITYMAPS_API_FORECAST = "https://api.electricitymap.org/v3/carbon-intensity/forecast"
-ELECTRICITYMAPS_API_LATEST   = "https://api.electricitymap.org/v3/carbon-intensity/latest"
+EM_BASE = os.environ.get("ELECTRICITYMAPS_BASE", "https://api.electricitymaps.com")
+ELECTRICITYMAPS_API_FORECAST = f"{EM_BASE}/v3/carbon-intensity/forecast"
+ELECTRICITYMAPS_API_LATEST   = f"{EM_BASE}/v3/carbon-intensity/latest"
 DEFAULT_PUE = float(os.environ.get("PUE_DEFAULT", "1.4"))
 EM_TIMEOUT  = 20
 RETRIES     = 2
 
-EM_TOKEN       = os.environ.get("ELECTRICITYMAPS_TOKEN")  # may be empty on purpose for mock mode
-SITES_JSON     = os.environ.get("SITES_JSON")  # optional: path to a JSON array of sites
+EM_TOKEN       = os.environ.get("ELECTRICITYMAPS_TOKEN")
+SITES_JSON     = os.environ.get("SITES_JSON")
 
 # --------------------------------------------------------------------------------------
 # Auth
@@ -250,13 +251,26 @@ def compute_ci(req: CIRequest, _=Depends(require_bearer)):
         return cfp_g, cfp_kg
 
     if req.time:
-        fc = fetch_ci_forecast(req.lat, req.lon)
-        chosen = pick_ci_at_time(fc, req.time)
-        ci = float(chosen["carbonIntensity"])
-        eff = ci * req.pue
-        cfp_g, cfp_kg = compute_cfp(req.energy_kwh)
-        return CIResponse(source="electricitymaps", zone=None, datetime=chosen["datetime"],
-                          ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
+        try:
+            fc = fetch_ci_forecast(req.lat, req.lon)
+            chosen = pick_ci_at_time(fc, req.time)
+            ci = float(chosen["carbonIntensity"])
+            eff = ci * req.pue
+            cfp_g, cfp_kg = compute_cfp(req.energy_kwh)
+            return CIResponse(source="electricitymaps", zone=None, datetime=chosen["datetime"],
+                            ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff,
+                            cfp_g=cfp_g, cfp_kg=cfp_kg)
+        except requests.HTTPError as e:
+            if e.response is not None and e.response.status_code in (401, 403):
+                # fallback to latest when forecast isn't authorised
+                latest = fetch_ci_latest(req.lat, req.lon)
+                ci = float(latest["carbonIntensity"])
+                eff = ci * req.pue
+                cfp_g, cfp_kg = compute_cfp(req.energy_kwh)
+                return CIResponse(source="electricitymaps/latest", zone=latest.get("zone"),
+                                datetime=latest["datetime"], ci_gco2_per_kwh=ci, pue=req.pue,
+                                effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
+            raise
     else:
         latest = fetch_ci_latest(req.lat, req.lon)
         ci = float(latest["carbonIntensity"])
