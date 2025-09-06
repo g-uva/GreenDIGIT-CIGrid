@@ -4,6 +4,7 @@ from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Dict, Any
 import requests
 from dateutil import parser as dtparse
+from functools import lru_cache
 
 from fastapi import FastAPI, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -26,6 +27,15 @@ SITES_JSON     = os.environ.get("SITES_JSON")  # optional: path to a JSON array 
 # --------------------------------------------------------------------------------------
 security = HTTPBearer()
 AUTH_VERIFY_URL = os.environ.get("AUTH_VERIFY_URL", "https://mc-a4.lab.uvalight.net/gd-cim-api/verify_token")
+
+@lru_cache(maxsize=1)
+def _load_sites_from_file() -> list[dict]:
+    path = os.environ.get("SITES_FILE", "/data/sites_latlngpue.json")
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"SITES_FILE not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+    
 
 def require_bearer(creds: HTTPAuthorizationCredentials = Depends(security)):
     token = creds.credentials
@@ -255,6 +265,7 @@ def compute_ci(req: CIRequest, _=Depends(require_bearer)):
         return CIResponse(source="electricitymaps", zone=latest.get("zone"), datetime=latest["datetime"],
                           ci_gco2_per_kwh=ci, pue=req.pue, effective_ci_gco2_per_kwh=eff, cfp_g=cfp_g, cfp_kg=cfp_kg)
 
+
 def load_sites_from_env() -> List[Site]:
     if not SITES_JSON:
         raise HTTPException(status_code=400, detail="No sites provided and SITES_JSON env not set")
@@ -301,3 +312,10 @@ def rank_sites(req: RankRequest, _=Depends(require_bearer)):
     # sort by effective CI ascending (best first)
     results.sort(key=lambda r: r.effective_ci_gco2_per_kwh)
     return RankResponse(start_time=when.isoformat(), results=results)
+
+@app.get("/load-sites", tags=["Sites"], summary="Returns site with list of lat/lng/pue.")
+def load_sites():
+    try:
+        return _load_sites_from_file()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

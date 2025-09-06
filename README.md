@@ -17,6 +17,7 @@ $$
 $$
 
 Also in kg: 
+
 $$ 
 \mathrm{CFP}_{kg} = \mathrm{CFP}/1000 
 $$
