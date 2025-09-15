@@ -29,7 +29,7 @@ ELECTRICITYMAPS_API_LATEST = "https://api.electricitymaps.com/v3/carbon-intensit
 ELECTRICITYMAPS_API_FORECAST = "https://api.electricitymaps.com/v3/carbon-intensity/forecast"
 
 # Retainment store
-RETAIN_MONGO_URI = os.environ.get("RETAIN_MONGO_URI")  # e.g. mongodb://ci-retain-db:27017/?replicaSet=rs0
+RETAIN_MONGO_URI = os.environ.get("RETAIN_MONGO_URI", "mongodb://ci-retain-db-1:27017,ci-retain-db-2:27017,ci-retain-db-3:27017/?replicaSet=rs0")
 RETAIN_DB_NAME = os.environ.get("RETAIN_DB_NAME", "ci-retainment-db")
 RETAIN_COLL = os.environ.get("RETAIN_COLL", "pending_ci")
 RETAIN_TTL_SECONDS = int(os.environ.get("RETAIN_TTL_SECONDS", "172800"))  # 2 days
@@ -44,6 +44,10 @@ AUTH_VERIFY_URL = os.environ.get("AUTH_VERIFY_URL")  # e.g. http://login-server:
 PUE_DEFAULT = float(os.environ.get("PUE_DEFAULT", "1.4"))
 TIMEOUT = int(os.environ.get("TIMEOUT", "20"))
 RETRIES = int(os.environ.get("RETRIES", "2"))
+
+PUE_STATIC = 1.4
+
+TEST_FORCE_INVALID = os.getenv("TEST_FORCE_INVALID","false").lower()=="true"
 
 # -----------------------------
 # App
@@ -72,6 +76,7 @@ class CIRequest(BaseModel):
     pue: float = Field(default=PUE_DEFAULT, description="Power Usage Effectiveness")
     energy_kwh: Optional[float] = Field(default=None, description="If provided, CFP is computed")
     time: Optional[datetime] = Field(default=None, description="UTC timestamp; if omitted provider will use latest")
+    metric_id: str | None = None # Necessary to merge the metric back from the retain-DB queue.
 
 class CIResponse(BaseModel):
     source: str
@@ -194,6 +199,31 @@ def wp_pick(payload):
         return payload[0]
     return payload
 
+def to_ci_request(doc: dict) -> dict:
+    b = (doc or {}).get("body", {})
+    node = b.get("node")
+    site = SITES_JSON.get(node) or {}
+    payload = {"lat": site.get("lat"), "lon": site.get("lon"), "pue": float(site.get("pue", PUE_STATIC))}
+
+    # time (only if present)
+    ts = b.get("ts")
+    if isinstance(ts, str) and ts.strip():
+        payload["time"] = ts.strip()
+
+    # --- ENERGY: pass through or derive ---
+    energy_kwh = (
+        b.get("energy_kwh")
+        or (b.get("energy_Wh") / 1000.0 if b.get("energy_Wh") is not None else None)
+        or (b.get("joules") / 3_600_000.0 if b.get("joules") is not None else None)
+    )
+    # derive from power & duration if present
+    if energy_kwh is None and b.get("power_w") is not None and b.get("duration_s") is not None:
+        energy_kwh = (float(b["power_w"]) * float(b["duration_s"])) / 3_600_000.0
+
+    if energy_kwh is not None:
+        payload["energy_kwh"] = float(energy_kwh)
+
+    return payload
 
 # -----------------------------
 # Endpoints
@@ -215,6 +245,28 @@ def load_sites():
 def compute_ci(req: CIRequest, _=Depends(require_bearer)):
     # Provider: Wattprint
     if CI_PROVIDER == "wattprint":
+
+        ## Testing force into database, might delete later.
+        if TEST_FORCE_INVALID:
+            payload = {"valid": False}  # simulate partner “not ready”
+        else:
+            payload = wattprint_fetch(req.lat, req.lon, start, end, aggregate=True)
+            payload = wp_pick(payload)
+        valid = payload.get("valid", False)
+        if not valid:
+            coll = get_retain_collection()
+            coll.insert_one({
+                "provider":"wattprint",
+                "creation_time": datetime.now(timezone.utc),
+                "request_time": [datetime.now(timezone.utc)-timedelta(hours=1), datetime.now(timezone.utc)+timedelta(hours=2)],
+                "lat": req.lat, "lon": req.lon, "pue": req.pue,
+                "energy_kwh": req.energy_kwh,
+                "raw_response": payload,
+                "valid": False,
+                "metric_id": req.metric_id,
+            })
+            raise HTTPException(status_code=202, detail="CI invalid; retained for re-check within TTL")
+
         when = req.time or datetime.now(timezone.utc)
         start = when - timedelta(hours=1)
         end = when + timedelta(hours=2)
