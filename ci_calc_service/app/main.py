@@ -16,7 +16,7 @@ RETAIN_MONGO_URI = os.getenv("RETAIN_MONGO_URI")
 RETAIN_DB_NAME   = os.getenv("RETAIN_DB_NAME", "ci-retainment-db")
 RETAIN_COLL      = os.getenv("RETAIN_COLL", "pending_ci")
 
-CNR_SQL_FORWARD_URL = os.getenv("CNR_SQL_FORWARD_URL", "http://cnr-sql-service")
+CNR_SQL_FORWARD_URL = os.getenv("CNR_SQL_FORWARD_URL", "http://sql-cnr-adapter:8033/cnr-sql-service")
 PUE_DEFAULT = os.getenv("PUE_DEFAULT", "1.7")
 
 SITES_PATH = os.environ.get("SITES_JSON", "/data/sites_latlngpue.json")  # volume mount
@@ -62,7 +62,7 @@ class CIRequest(BaseModel):
     lat: float
     lon: float
     pue: Optional[float] = 1.4
-    energy_kwh: Optional[float] = None
+    energy_wh: Optional[float] = None
     time: Optional[datetime] = None
     metric_id: Optional[str] = None
 
@@ -94,7 +94,7 @@ class MetricsEnvelope(BaseModel):
 
     # optional inputs to CI calculation
     pue: Optional[float] = None
-    energy_kwh: Optional[float] = None
+    energy_wh: Optional[float] = None
     
 def _load_sites_map() -> dict:
     """Load array JSON into a dict keyed by site_name."""
@@ -134,7 +134,7 @@ def maybe_retain_invalid(ci_payload: Dict[str, Any], req: CIRequest, start: date
             "lat": req.lat,
             "lon": req.lon,
             "pue": req.pue,
-            "energy_kwh": req.energy_kwh,
+            "energy_wh": req.energy_wh,
             "raw_response": ci_payload,
             "valid": bool(ci_payload.get("valid", False)),
         })
@@ -153,7 +153,7 @@ def get_ci(req: CIRequest):
     ci = float(payload["value"])
     dt_str = payload.get("end") or payload.get("start")
     eff = ci * float(req.pue)
-    cfp_g = eff * req.energy_kwh if req.energy_kwh is not None else None
+    cfp_g = eff * req.energy_wh if req.energy_wh is not None else None
     cfp_kg = (cfp_g / 1000.0) if cfp_g is not None else None
     valid_flag = bool(payload.get("valid", False))
     if not valid_flag:
@@ -182,7 +182,7 @@ def compute_ci_valid(req: CIRequest):
     ci = float(payload["value"])
     dt_str = payload.get("end") or payload.get("start")
     eff = ci * float(req.pue)
-    cfp_g = eff * req.energy_kwh if req.energy_kwh is not None else None
+    cfp_g = eff * req.energy_wh if req.energy_wh is not None else None
     cfp_kg = (cfp_g / 1000.0) if cfp_g is not None else None
     return CIResponse(
         source="wattprint",
@@ -216,7 +216,6 @@ def _infer_times(payload: MetricsEnvelope) -> tuple[datetime, datetime, datetime
 
 @app.post("/transform-and-forward")
 def transform_and_forward(payload: MetricsEnvelope = Body(...)):
-    # Resolve lat/lon from site mapping if absent
     site_name = payload.site or payload.fact_site_event.get("site")
     if (payload.lat is None or payload.lon is None) and site_name:
         site = SITES_MAP.get(site_name)
@@ -237,26 +236,43 @@ def transform_and_forward(payload: MetricsEnvelope = Body(...)):
     if payload.lat is None or payload.lon is None:
         raise HTTPException(status_code=400, detail="lat and lon are required or must be resolvable from 'site'")
 
-    # Derive times & duration (unchanged)
     start_exec, stop_exec, when = _infer_times(payload)
     if payload.duration_s is None:
         payload.duration_s = int((stop_exec - start_exec).total_seconds())
+        
+    fse = payload.fact_site_event
+    e_wh = payload.energy_wh if payload.energy_wh is not None else fse.get("energy_wh")
+    if e_wh is not None:
+        try:
+            e_wh = float(e_wh)
+        except Exception:
+            e_wh = None
 
-    # Build CI request; prefer site PUE if not present in payload
+    # fallback derivations (optional)
+    if e_wh is None and fse.get("energy_kwh") is not None:
+        e_wh = float(fse["energy_kwh"]) * 1000.0
+    if e_wh is None and fse.get("power_w") is not None and payload.duration_s is not None:
+        # power (W) * duration (s) -> Joules / 3600 -> Wh
+        e_wh = float(fse["power_w"]) * float(payload.duration_s) / 3600.0
+    
+    payload.energy_wh = e_wh
+    if e_wh is not None:
+        fse["energy_wh"] = e_wh
+
     site_pue = None
-    if payload.site and payload.site in SITES_MAP:
-        site_pue = SITES_MAP[payload.site].get("pue", PUE_DEFAULT)
+    site_name = payload.site or payload.fact_site_event.get("site")
+    if site_name and site_name in SITES_MAP:
+        site_pue = float(SITES_MAP[site_name].get("pue", float(PUE_DEFAULT)))
 
     ci_req = CIRequest(
         lat=payload.lat,
         lon=payload.lon,
         pue=float(payload.fact_site_event.get("PUE") or site_pue or PUE_DEFAULT),
-        energy_kwh=payload.energy_kwh,
+        energy_wh=payload.energy_wh,
         time=when,
         metric_id=str(payload.detail_cloud.get("event_id", "")) or payload.detail_cloud.get("execunitid"),
     )
 
-    # Reuse the same logic used by /get-ci (don’t duplicate code)
     start = when - timedelta(hours=1)
     end   = when + timedelta(hours=2)
     try:
@@ -266,16 +282,21 @@ def transform_and_forward(payload: MetricsEnvelope = Body(...)):
 
     ci = float(wp["value"])
     eff_ci = ci * float(ci_req.pue)
-    cfp_g = eff_ci * ci_req.energy_kwh if ci_req.energy_kwh is not None else None
+    
+    energy_kwh = (ci_req.energy_wh / 1000.0) if ci_req.energy_wh is not None else None
+    cfp_g = eff_ci * energy_kwh if energy_kwh is not None else None
+    
+    print(f"[ci] ci={ci} pue={ci_req.pue} eff_ci={eff_ci} "
+      f"energy_wh={ci_req.energy_wh} energy_kwh={(ci_req.energy_wh/1000.0) if ci_req.energy_wh else None} "
+      f"-> cfp_g={cfp_g}", flush=True)
 
-    # ---- 4) Inject PUE / CI_g / CFP_g into fact_site_event ----
     fse = payload.fact_site_event
+    
     fse["PUE"]  = float(ci_req.pue)
     fse["CI_g"] = ci
     if cfp_g is not None:
         fse["CFP_g"] = cfp_g
 
-    # ---- 5) Forward full (now-enriched) document to the CNR-SQL service ----
     try:
         r = sess.post(CNR_SQL_FORWARD_URL, json=payload.dict(), timeout=20)
         if not r.ok:
