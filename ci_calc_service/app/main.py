@@ -1,372 +1,287 @@
 import os
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Dict, Any, List
-
 import requests
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
-from urllib.parse import urlencode
+from datetime import datetime, timedelta, timezone
+from fastapi import FastAPI, HTTPException, Body
+from pydantic import BaseModel
+from typing import Optional, Dict, Any
 from pymongo import MongoClient
 
-# -----------------------------
-# Config
-# -----------------------------
-ROOT_PATH = os.environ.get("ROOT_PATH", "")  # e.g., "/gd-ci-service"
+app = FastAPI()
 
-# Provider selection
-CI_PROVIDER = os.environ.get("CI_PROVIDER", "wattprint").lower()  # "wattprint" or "electricitymaps"
+WATTPRINT_BASE = os.getenv("WATTPRINT_BASE", "https://api.wattprint.eu")
+WATTPRINT_TOKEN = os.getenv("WATTPRINT_TOKEN")
 
-# Wattprint
-WATTPRINT_BASE = os.environ.get("WATTPRINT_BASE", "https://api.wattprint.eu")
-WATTPRINT_PATH = "/v1/footprints"
-WATTPRINT_TOKEN = os.environ.get("WATTPRINT_TOKEN")
+RETAIN_MONGO_URI = os.getenv("RETAIN_MONGO_URI")
+RETAIN_DB_NAME   = os.getenv("RETAIN_DB_NAME", "ci-retainment-db")
+RETAIN_COLL      = os.getenv("RETAIN_COLL", "pending_ci")
 
-# ElectricityMaps (optional)
-EM_TOKEN = os.environ.get("ELECTRICITYMAPS_TOKEN")
-ELECTRICITYMAPS_API_LATEST = "https://api.electricitymaps.com/v3/carbon-intensity/latest"
-ELECTRICITYMAPS_API_FORECAST = "https://api.electricitymaps.com/v3/carbon-intensity/forecast"
+CNR_SQL_FORWARD_URL = os.getenv("CNR_SQL_FORWARD_URL", "http://cnr-sql-service")
+PUE_DEFAULT = os.getenv("PUE_DEFAULT", "1.7")
 
-# Retainment store
-RETAIN_MONGO_URI = os.environ.get("RETAIN_MONGO_URI", "mongodb://ci-retain-db-1:27017,ci-retain-db-2:27017,ci-retain-db-3:27017/?replicaSet=rs0")
-RETAIN_DB_NAME = os.environ.get("RETAIN_DB_NAME", "ci-retainment-db")
-RETAIN_COLL = os.environ.get("RETAIN_COLL", "pending_ci")
-RETAIN_TTL_SECONDS = int(os.environ.get("RETAIN_TTL_SECONDS", "172800"))  # 2 days
+SITES_PATH = os.environ.get("SITES_JSON", "/data/sites_latlngpue.json")  # volume mount
+SITES_MAP: dict[str, dict] = {}  # site_name -> {lat, lon, pue}
 
-# Sites JSON for /load-sites (optional; used by publisher to map nodes->sites)
-SITES_JSON = os.environ.get("SITES_JSON", "/data/sites_latlngpue.json")
+sess = requests.Session()
 
-# Auth verification for /ci and /rank-sites (optional)
-AUTH_VERIFY_URL = os.environ.get("AUTH_VERIFY_URL")  # e.g. http://login-server:8001/verify
-
-# Defaults/timeouts
-PUE_DEFAULT = float(os.environ.get("PUE_DEFAULT", "1.4"))
-TIMEOUT = int(os.environ.get("TIMEOUT", "20"))
-RETRIES = int(os.environ.get("RETRIES", "2"))
-
-PUE_STATIC = 1.4
-
-TEST_FORCE_INVALID = os.getenv("TEST_FORCE_INVALID","false").lower()=="true"
-
-# -----------------------------
-# App
-# -----------------------------
-app = FastAPI(
-    title="GreenDIGIT CI Calculator",
-    description="Computes carbon intensity using Wattprint or ElectricityMaps with retain-until-valid behaviour.",
-    version="1.0.0",
-    root_path=ROOT_PATH
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -----------------------------
-# Models
-# -----------------------------
-class CIRequest(BaseModel):
-    lat: float
-    lon: float
-    pue: float = Field(default=PUE_DEFAULT, description="Power Usage Effectiveness")
-    energy_kwh: Optional[float] = Field(default=None, description="If provided, CFP is computed")
-    time: Optional[datetime] = Field(default=None, description="UTC timestamp; if omitted provider will use latest")
-    metric_id: str | None = None # Necessary to merge the metric back from the retain-DB queue.
-
-class CIResponse(BaseModel):
-    source: str
-    zone: Optional[str] = None
-    datetime: str
-    ci_gco2_per_kwh: float
-    pue: float
-    effective_ci_gco2_per_kwh: float
-    cfp_g: Optional[float] = None
-    cfp_kg: Optional[float] = None
-
-class ExternalSubmissionResponse(BaseModel):
-    body: str
-
-# -----------------------------
-# Auth
-# -----------------------------
-def require_bearer(req: Request):
-    """Simple bearer-token gate. If AUTH_VERIFY_URL is set, call it to validate token; else require presence only."""
-    auth = req.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    token = auth[len("Bearer "):].strip()
-    if not token:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    if AUTH_VERIFY_URL:
-        try:
-            vr = requests.get(AUTH_VERIFY_URL, headers={"Authorization": f"Bearer {token}"}, timeout=TIMEOUT)
-            if vr.status_code != 200:
-                raise HTTPException(status_code=401, detail="Unauthorized")
-        except Exception:
-            raise HTTPException(status_code=401, detail="Unauthorized")
-    return True
-
-# -----------------------------
-# Helpers
-# -----------------------------
-def em_headers() -> Dict[str, str]:
-    if not EM_TOKEN:
-        raise RuntimeError("ELECTRICITYMAPS_TOKEN not set")
-    return {"auth-token": EM_TOKEN}
-
-def fetch_ci_latest(lat: float, lon: float) -> Dict[str, Any]:
-    params = {"lat": lat, "lon": lon}
-    last: Optional[Exception] = None
-    for _ in range(RETRIES + 1):
-        try:
-            r = requests.get(ELECTRICITYMAPS_API_LATEST, headers=em_headers(), params=params, timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-    assert last is not None
-    raise last
-
-def fetch_ci_forecast(lat: float, lon: float) -> List[Dict[str, Any]]:
-    params = {"lat": lat, "lon": lon}
-    last: Optional[Exception] = None
-    for _ in range(RETRIES + 1):
-        try:
-            r = requests.get(ELECTRICITYMAPS_API_FORECAST, headers=em_headers(), params=params, timeout=TIMEOUT)
-            r.raise_for_status()
-            payload = r.json()
-            return payload.get("forecast", [])
-        except Exception as e:
-            last = e
-    assert last is not None
-    raise last
+def to_iso_z(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc).replace(microsecond=0)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 def wp_headers() -> Dict[str, str]:
     if not WATTPRINT_TOKEN:
-        raise RuntimeError("WATTPRINT_COOKIE not set")
+        raise RuntimeError("WATTPRINT_TOKEN not set")
     return {"Accept": "application/json", "Authorization": f"Bearer {WATTPRINT_TOKEN}"}
 
-def wattprint_fetch(lat: float, lon: float, start: datetime, end: datetime, aggregate: bool = True) -> Dict[str, Any]:
-    qs = {
-        "lat": f"{lat:.4f}",
-        "lon": f"{lon:.4f}",
+def wattprint_fetch(lat: float, lon: float, start: datetime, end: datetime, aggregate=True) -> Dict[str, Any]:
+    url = f"{WATTPRINT_BASE}/v1/footprints"
+    params = {
+        "lat": lat,
+        "lon": lon,
         "footprint_type": "carbon",
-        "start": start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "end": end.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "start": to_iso_z(start),
+        "end": to_iso_z(end),
         "aggregate": str(aggregate).lower(),
     }
-    url = f"{WATTPRINT_BASE}{WATTPRINT_PATH}?{urlencode(qs)}"
-    last: Optional[Exception] = None
-    for _ in range(RETRIES + 1):
-        try:
-            r = requests.get(url, headers=wp_headers(), timeout=TIMEOUT)
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last = e
-    assert last is not None
-    raise last
-
-def get_retain_collection():
-    if not RETAIN_MONGO_URI:
-        return None
-    client = MongoClient(RETAIN_MONGO_URI, appname="ci-retain")
-    coll = client[RETAIN_DB_NAME][RETAIN_COLL]
-    try:
-        coll.create_index("creation_time", expireAfterSeconds=RETAIN_TTL_SECONDS, name="ttl_creation_time")
-        coll.create_index([("lat", 1), ("lon", 1), ("request_time", -1)], name="latlon_reqtime")
-        coll.create_index("valid", name="valid_flag")
-    except Exception:
-        pass
-    return coll
-
-def compute_cfp(eff_value: float, energy_kwh: Optional[float]):
-    if energy_kwh is None:
-        return None, None
-    cfp_g = eff_value * energy_kwh
-    return cfp_g, cfp_g / 1000.0
-
-def wp_pick(payload):
-    """Accept list or dict; normalise to dict."""
-    if isinstance(payload, list):
-        if not payload:
+    headers = wp_headers()
+    print("[wattprint_fetch] URL:", url, "params:", params, flush=True)
+    r = sess.get(url, params=params, headers=headers, timeout=20)
+    if not r.ok:
+        print("[wattprint_fetch] status:", r.status_code, "body:", r.text[:300], flush=True)
+    r.raise_for_status()
+    data = r.json()
+    if isinstance(data, list):
+        if not data:
             raise HTTPException(status_code=502, detail="Wattprint returned empty list")
-        return payload[0]
-    return payload
+        return data[0]
+    return data
 
-def to_ci_request(doc: dict) -> dict:
-    b = (doc or {}).get("body", {})
-    node = b.get("node")
-    site = SITES_JSON.get(node) or {}
-    payload = {"lat": site.get("lat"), "lon": site.get("lon"), "pue": float(site.get("pue", PUE_STATIC))}
+class CIRequest(BaseModel):
+    lat: float
+    lon: float
+    pue: Optional[float] = 1.4
+    energy_kwh: Optional[float] = None
+    time: Optional[datetime] = None
+    metric_id: Optional[str] = None
 
-    # time (only if present)
-    ts = b.get("ts")
-    if isinstance(ts, str) and ts.strip():
-        payload["time"] = ts.strip()
+class CIResponse(BaseModel):
+    source: str
+    zone: Optional[str]
+    datetime: Optional[str]
+    ci_gco2_per_kwh: float
+    pue: float
+    effective_ci_gco2_per_kwh: float
+    cfp_g: Optional[float]
+    cfp_kg: Optional[float]
+    valid: bool
+    
+class MetricsEnvelope(BaseModel):
+    # top-level convenience fields
+    site: Optional[str] = None
+#     ts: Optional[datetime] = None
+    duration_s: Optional[int] = None
 
-    # --- ENERGY: pass through or derive ---
-    energy_kwh = (
-        b.get("energy_kwh")
-        or (b.get("energy_Wh") / 1000.0 if b.get("energy_Wh") is not None else None)
-        or (b.get("joules") / 3_600_000.0 if b.get("joules") is not None else None)
-    )
-    # derive from power & duration if present
-    if energy_kwh is None and b.get("power_w") is not None and b.get("duration_s") is not None:
-        energy_kwh = (float(b["power_w"]) * float(b["duration_s"])) / 3_600_000.0
+    # original document parts (kept as free-form dicts to avoid tight coupling)
+    sites: Dict[str, Any]
+    fact_site_event: Dict[str, Any]
+    detail_cloud: Dict[str, Any]
 
-    if energy_kwh is not None:
-        payload["energy_kwh"] = float(energy_kwh)
+    # for CI request (must be present or resolvable)
+    lat: Optional[float] = None
+    lon: Optional[float] = None
 
-    return payload
+    # optional inputs to CI calculation
+    pue: Optional[float] = None
+    energy_kwh: Optional[float] = None
+    
+def _load_sites_map() -> dict:
+    """Load array JSON into a dict keyed by site_name."""
+    with open(SITES_PATH, "r", encoding="utf-8") as f:
+        arr = json.load(f)
+    m = {}
+    for x in arr:
+        name = x.get("site_name")
+        lat, lon = x.get("latitude"), x.get("longitude")
+        if name and lat is not None and lon is not None:
+            m[name] = {
+                "lat": float(lat),
+                "lon": float(lon),
+                "pue": float(x.get("pue", float(PUE_DEFAULT))),
+            }
+    return m
 
-# -----------------------------
-# Endpoints
-# -----------------------------
-@app.get("/healthz")
-def healthz():
-    return {"ok": True, "provider": CI_PROVIDER}
+# load once at startup
+try:
+    SITES_MAP = _load_sites_map()
+    print(f"[sites] Loaded sites into the SITES_MAP variable.")
+except Exception as e:
+    print(f"[sites] failed to load {SITES_PATH}: {e}", flush=True)
+    SITES_MAP = {}
 
-@app.get("/load-sites", summary="Return sites JSON if present")
-def load_sites():
+def maybe_retain_invalid(ci_payload: Dict[str, Any], req: CIRequest, start: datetime, end: datetime):
+    if not RETAIN_MONGO_URI:
+        return
     try:
-        with open(SITES_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data
+        cli = MongoClient(RETAIN_MONGO_URI, appname="ci-calc-get-ci", serverSelectionTimeoutMS=3000)
+        coll = cli[RETAIN_DB_NAME][RETAIN_COLL]
+        coll.insert_one({
+            "metric_id": req.metric_id,
+            "provider": "wattprint",
+            "creation_time": datetime.now(timezone.utc),
+            "request_time": [start, end],
+            "lat": req.lat,
+            "lon": req.lon,
+            "pue": req.pue,
+            "energy_kwh": req.energy_kwh,
+            "raw_response": ci_payload,
+            "valid": bool(ci_payload.get("valid", False)),
+        })
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load sites: {e}")
+        print("[retain] insert failed:", e, flush=True)
 
-@app.post("/ci", response_model=CIResponse)
-def compute_ci(req: CIRequest, _=Depends(require_bearer)):
-    # Provider: Wattprint
-    if CI_PROVIDER == "wattprint":
+@app.post("/get-ci", response_model=CIResponse)
+def get_ci(req: CIRequest):
+    when  = req.time or datetime.now(timezone.utc)
+    start = when - timedelta(hours=1)
+    end   = when + timedelta(hours=2)
+    try:
+        payload = wattprint_fetch(req.lat, req.lon, start, end, aggregate=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Wattprint error: {e}")
+    ci = float(payload["value"])
+    dt_str = payload.get("end") or payload.get("start")
+    eff = ci * float(req.pue)
+    cfp_g = eff * req.energy_kwh if req.energy_kwh is not None else None
+    cfp_kg = (cfp_g / 1000.0) if cfp_g is not None else None
+    valid_flag = bool(payload.get("valid", False))
+    if not valid_flag:
+        maybe_retain_invalid(payload, req, start, end)
+    return CIResponse(
+        source="wattprint",
+        zone=payload.get("zone"),
+        datetime=dt_str,
+        ci_gco2_per_kwh=ci,
+        pue=float(req.pue),
+        effective_ci_gco2_per_kwh=eff,
+        cfp_g=cfp_g,
+        cfp_kg=cfp_kg,
+        valid=valid_flag,
+    )
 
-        ## Testing force into database, might delete later.
-        if TEST_FORCE_INVALID:
-            payload = {"valid": False}  # simulate partner “not ready”
-        else:
-            payload = wattprint_fetch(req.lat, req.lon, start, end, aggregate=True)
-            payload = wp_pick(payload)
-        valid = payload.get("valid", False)
-        if not valid:
-            coll = get_retain_collection()
-            coll.insert_one({
-                "provider":"wattprint",
-                "creation_time": datetime.now(timezone.utc),
-                "request_time": [datetime.now(timezone.utc)-timedelta(hours=1), datetime.now(timezone.utc)+timedelta(hours=2)],
-                "lat": req.lat, "lon": req.lon, "pue": req.pue,
-                "energy_kwh": req.energy_kwh,
-                "raw_response": payload,
-                "valid": False,
-                "metric_id": req.metric_id,
-            })
-            raise HTTPException(status_code=202, detail="CI invalid; retained for re-check within TTL")
+@app.post("/ci-valid", response_model=CIResponse)
+def compute_ci_valid(req: CIRequest):
+    when  = req.time or datetime.now(timezone.utc)
+    start = when - timedelta(hours=1)
+    end   = when + timedelta(hours=2)
+    try:
+        payload = wattprint_fetch(req.lat, req.lon, start, end, aggregate=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Wattprint error: {e}")
+    ci = float(payload["value"])
+    dt_str = payload.get("end") or payload.get("start")
+    eff = ci * float(req.pue)
+    cfp_g = eff * req.energy_kwh if req.energy_kwh is not None else None
+    cfp_kg = (cfp_g / 1000.0) if cfp_g is not None else None
+    return CIResponse(
+        source="wattprint",
+        zone=payload.get("zone"),
+        datetime=dt_str,
+        ci_gco2_per_kwh=ci,
+        pue=float(req.pue),
+        effective_ci_gco2_per_kwh=eff,
+        cfp_g=cfp_g,
+        cfp_kg=cfp_kg,
+        valid=bool(payload.get("valid", False)),
+    )
 
-        when = req.time or datetime.now(timezone.utc)
-        start = when - timedelta(hours=1)
-        end = when + timedelta(hours=2)
-        try:
-            payload = wattprint_fetch(req.lat, req.lon, start, end, aggregate=True)
-            payload = wp_pick(payload) # normalise for the [] map.
-            valid = bool(payload.get("valid", False))
-            valid = bool(payload.get("valid", False))
-            if valid:
-                ci = float(payload["value"])  # gCO2/kWh
-                dt_str = payload.get("end") or payload.get("start")
-                zone = payload.get("zone")
-                eff = ci * req.pue
-                cfp_g, cfp_kg = compute_cfp(eff, req.energy_kwh)
-                return CIResponse(
-                    source="wattprint",
-                    zone=zone,
-                    datetime=dt_str,
-                    ci_gco2_per_kwh=ci,
-                    pue=req.pue,
-                    effective_ci_gco2_per_kwh=eff,
-                    cfp_g=cfp_g,
-                    cfp_kg=cfp_kg,
-                )
-            else:
-                coll = get_retain_collection()
-                if coll is None:
-                    raise HTTPException(status_code=503, detail="CI invalid and retainment store not configured")
-                coll.insert_one({
-                    "provider":"wattprint",
-                    "creation_time": datetime.now(timezone.utc),
-                    "request_time": [start, end],
-                    "lat": req.lat, "lon": req.lon, "pue": req.pue,
-                    "energy_kwh": req.energy_kwh,
-                    "raw_response": payload,
-                    "valid": False,
-                })
-                raise HTTPException(status_code=202, detail="CI invalid; retained for re-check within TTL")
-        except HTTPException:
-            raise
-        except Exception as e:
-            if EM_TOKEN:
-                try:
-                    latest = fetch_ci_latest(req.lat, req.lon)
-                    ci = float(latest["carbonIntensity"])
-                    eff = ci * req.pue
-                    cfp_g, cfp_kg = compute_cfp(eff, req.energy_kwh)
-                    return CIResponse(
-                        source="electricitymaps/latest",
-                        zone=latest.get("zone"),
-                        datetime=latest["datetime"],
-                        ci_gco2_per_kwh=ci,
-                        pue=req.pue,
-                        effective_ci_gco2_per_kwh=eff,
-                        cfp_g=cfp_g,
-                        cfp_kg=cfp_kg,
-                    )
-                except Exception:
-                    pass
-            raise HTTPException(status_code=502, detail=f"Wattprint error: {e}")
-
-    # Provider: ElectricityMaps
-    when = req.time
-    if when is None:
-        latest = fetch_ci_latest(req.lat, req.lon)
-        ci = float(latest["carbonIntensity"])
-        eff = ci * req.pue
-        cfp_g, cfp_kg = compute_cfp(eff, req.energy_kwh)
-        return CIResponse(
-            source="electricitymaps/latest",
-            zone=latest.get("zone"),
-            datetime=latest["datetime"],
-            ci_gco2_per_kwh=ci,
-            pue=req.pue,
-            effective_ci_gco2_per_kwh=eff,
-            cfp_g=cfp_g,
-            cfp_kg=cfp_kg,
-        )
+def _infer_times(payload: MetricsEnvelope) -> tuple[datetime, datetime, datetime]:
+    """Return (start_exec, stop_exec, when_for_ci)."""
+    fse = payload.fact_site_event
+    # parse exec window
+    start = datetime.fromisoformat(fse["startexectime"].replace("Z", "+00:00"))
+    stop  = datetime.fromisoformat(fse["stopexectime"].replace("Z", "+00:00"))
+#     # CI 'when' – prefer top-level ts, else event_end_timestamp, else stop time
+#     if payload.ts:
+#         when = payload.ts
+    if "event_end_timestamp" in fse:
+        when = datetime.fromisoformat(fse["event_end_timestamp"].replace("Z", "+00:00"))
     else:
-        fc = fetch_ci_forecast(req.lat, req.lon)
-        target = when.replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc)
-        best = None
-        best_dt = None
-        for item in fc:
-            dt = datetime.fromisoformat(item["datetime"].replace("Z", "+00:00"))
-            if best is None or abs((dt - target).total_seconds()) < abs((best_dt - target).total_seconds()):
-                best = item
-                best_dt = dt
-        if best is None:
-            raise HTTPException(status_code=502, detail="No forecast data from ElectricityMaps")
-        ci = float(best["carbonIntensity"])
-        eff = ci * req.pue
-        cfp_g, cfp_kg = compute_cfp(eff, req.energy_kwh)
-        return CIResponse(
-            source="electricitymaps/forecast",
-            zone=best.get("zone"),
-            datetime=best["datetime"],
-            ci_gco2_per_kwh=ci,
-            pue=req.pue,
-            effective_ci_gco2_per_kwh=eff,
-            cfp_g=cfp_g,
-            cfp_kg=cfp_kg,
-        )
+        when = stop
+    # normalise to UTC and strip microseconds
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (start, stop, when.astimezone(timezone.utc).replace(microsecond=0))
+
+@app.post("/transform-and-forward")
+def transform_and_forward(payload: MetricsEnvelope = Body(...)):
+    # Resolve lat/lon from site mapping if absent
+    site_name = payload.site or payload.fact_site_event.get("site")
+    if (payload.lat is None or payload.lon is None) and site_name:
+        site = SITES_MAP.get(site_name)
+        if not site:
+            try:
+                SITES_MAP.update(_load_sites_map())
+                site = SITES_MAP.get(site_name)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=f"Failed to reload sites: {e}")
+        if not site:
+            raise HTTPException(status_code=400, detail=f"No mapping for site '{site_name}' in {SITES_PATH}")
+        payload.lat = site["lat"]
+        payload.lon = site["lon"]
+        # prefer PUE from mapping unless already provided
+        if payload.fact_site_event.get("PUE") is None and payload.__dict__.get("pue") is None:
+            pass
+
+    if payload.lat is None or payload.lon is None:
+        raise HTTPException(status_code=400, detail="lat and lon are required or must be resolvable from 'site'")
+
+    # Derive times & duration (unchanged)
+    start_exec, stop_exec, when = _infer_times(payload)
+    if payload.duration_s is None:
+        payload.duration_s = int((stop_exec - start_exec).total_seconds())
+
+    # Build CI request; prefer site PUE if not present in payload
+    site_pue = None
+    if payload.site and payload.site in SITES_MAP:
+        site_pue = SITES_MAP[payload.site].get("pue", PUE_DEFAULT)
+
+    ci_req = CIRequest(
+        lat=payload.lat,
+        lon=payload.lon,
+        pue=float(payload.fact_site_event.get("PUE") or site_pue or PUE_DEFAULT),
+        energy_kwh=payload.energy_kwh,
+        time=when,
+        metric_id=str(payload.detail_cloud.get("event_id", "")) or payload.detail_cloud.get("execunitid"),
+    )
+
+    # Reuse the same logic used by /get-ci (don’t duplicate code)
+    start = when - timedelta(hours=1)
+    end   = when + timedelta(hours=2)
+    try:
+        wp = wattprint_fetch(ci_req.lat, ci_req.lon, start, end, aggregate=True)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Wattprint error: {e}")
+
+    ci = float(wp["value"])
+    eff_ci = ci * float(ci_req.pue)
+    cfp_g = eff_ci * ci_req.energy_kwh if ci_req.energy_kwh is not None else None
+
+    # ---- 4) Inject PUE / CI_g / CFP_g into fact_site_event ----
+    fse = payload.fact_site_event
+    fse["PUE"]  = float(ci_req.pue)
+    fse["CI_g"] = ci
+    if cfp_g is not None:
+        fse["CFP_g"] = cfp_g
+
+    # ---- 5) Forward full (now-enriched) document to the CNR-SQL service ----
+    try:
+        r = sess.post(CNR_SQL_FORWARD_URL, json=payload.dict(), timeout=20)
+        if not r.ok:
+            print("[forward] status:", r.status_code, "body:", r.text[:300], flush=True)
+        r.raise_for_status()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Forwarding to CNR SQL service failed: {e}")
+
+    return {"status": "ok", "forwarded_to": CNR_SQL_FORWARD_URL}
